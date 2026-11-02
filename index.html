@@ -358,6 +358,11 @@
     <h1 class="page-title">Thank you for taking part</h1>
     <p>Your responses have been recorded. Please let the researcher know you are finished.</p>
     <p id="done-code"></p>
+    <h2 class="h2">Save your answers</h2>
+    <p>Please download your results file and give it to the researcher. It contains your answers, your recorded speech and the speech measures.</p>
+    <div class="actions"><button id="save-json" class="btn" type="button">Download my results</button><button id="save-csv" class="btn secondary" type="button">Download summary (CSV)</button></div>
+    <p id="save-note" class="hint" aria-live="polite"></p>
+    <textarea id="save-area" class="copy-area" readonly hidden aria-label="Your results"></textarea>
     <div class="actions" id="done-actions"></div>
   </div>
 </main>
@@ -435,6 +440,8 @@ const CONFIG = {
   fillers: ['um', 'uh', 'er', 'erm', 'ah', 'hmm', 'mm', 'uhm'],
   asrLang: 'en-US',
   showResearcherButton: true,
+  /* 'always' = live transcript shown to every participant (removes the transcript factor); 'factorial' = 2 x 2 as in the study document. */
+  transcriptMode: 'always',
   randomizeItems: true,
   attentionCheck: true,
   completionUrl: '',
@@ -688,6 +695,7 @@ const Log = {
   saveToDevice() { try { const all = this.device().filter(r => r.session_id !== S.sessionId); all.push(this.record()); localStorage.setItem(CONFIG.storageKey, JSON.stringify(all)); } catch {} },
 };
 
+function applyTranscriptMode() { if (CONFIG.transcriptMode === 'always') S.transcript = 'visible'; }
 function requestedCell() {
   const map = { c1: 'partner,absent', c2: 'partner,visible', c3: 'evaluator,absent', c4: 'evaluator,visible' };
   for (const k of Object.keys(map)) if (hashFlags.has(k)) return map[k];
@@ -787,7 +795,7 @@ const UI = {
 
   renderResearcher() {
     if ($('researcher-panel').hidden) return;
-    $('rv-role').value = S.role; $('rv-tx').value = S.transcript;
+    $('rv-role').value = S.role; $('rv-tx').value = S.transcript; $('rv-tx').disabled = CONFIG.transcriptMode === 'always';
     const cell = CELLS[`${S.role},${S.transcript}`];
     $('rv-assigned').textContent = `${cell.code} · ${cell.label} · ${S.assignedBy}`;
     $('rv-cond-note').textContent = S.locked ? 'The conversation has started. Changing the condition restarts it as a new session.' : 'Applies when the conversation starts.';
@@ -1090,7 +1098,7 @@ function newSession() {
   ASR.active = false; try { ASR.rec && ASR.rec.abort(); } catch {}
   try { Nod.stop(); } catch {}
   S = freshState();
-  const [cell, by] = assign(); [S.role, S.transcript] = cell.split(','); S.assignedBy = by;
+  const [cell, by] = assign(); [S.role, S.transcript] = cell.split(','); S.assignedBy = by; applyTranscriptMode();
   $('pid').value = S.pid; $('consent').checked = false; $('intro-error').textContent = '';
   $('browser-warning').hidden = !!SR || S.sim;
   ['chk-perm', 'chk-quiet', 'chk-voice', 'chk-asr'].forEach(id => $(id).classList.remove('ok', 'bad'));
@@ -1103,7 +1111,7 @@ function restartAs(cell) {
   const pid = S.pid, skip = S.skipSurveys, sim = S.sim, timing = S.timingKey, mic = S.mic;
   Log.event('restarted_by_researcher', { to: cell }); S.interrupted = true; Log.saveToDevice();
   newSession(); S.pid = pid || 'test'; S.skipSurveys = skip; S.sim = sim; S.timingKey = timing; S.mic = mic;
-  [S.role, S.transcript] = cell.split(','); S.assignedBy = 'researcher';
+  [S.role, S.transcript] = cell.split(','); S.assignedBy = 'researcher'; applyTranscriptMode();
   startChat();
 }
 
@@ -1137,7 +1145,7 @@ $('rv-close').addEventListener('click', () => UI.toggleResearcher(false));
 document.addEventListener('keydown', e => { if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) { e.preventDefault(); UI.toggleResearcher(); } });
 const onCellChange = () => {
   const cell = `${$('rv-role').value},${$('rv-tx').value}`;
-  if (!S.locked) { [S.role, S.transcript] = cell.split(','); S.assignedBy = 'researcher'; UI.applyAgent(); Log.event('condition_override', { cell }); }
+  if (!S.locked) { [S.role, S.transcript] = cell.split(','); S.assignedBy = 'researcher'; applyTranscriptMode(); UI.applyAgent(); Log.event('condition_override', { cell }); }
   else restartAs(cell);
 };
 $('rv-role').addEventListener('change', onCellChange); $('rv-tx').addEventListener('change', onCellChange);
@@ -1160,6 +1168,20 @@ async function copy(text, label) {
   try { await navigator.clipboard.writeText(text); $('rv-data-note').textContent = `${label} copied to the clipboard.`; }
   catch { area.select(); $('rv-data-note').textContent = `Copy was blocked. ${label} is selected in the box below: press Ctrl+C or Cmd+C.`; }
 }
+function toDataUrl(blob) { return new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => res(null); r.readAsDataURL(blob); }); }
+async function participantFile() {   // full session JSON with the recorded audio embedded, so one file carries everything
+  const f = Log.full();
+  for (const x of f.responses) { const src = S.responses.find(r => r.id === x.id); if (src && src.audio) { x.audio_file = src.audioName; x.audio_base64 = await toDataUrl(src.audio); } }
+  return f;
+}
+async function saveForParticipant(name, text, type) {
+  const note = $('save-note'), area = $('save-area');
+  try { const url = URL.createObjectURL(new Blob([text], { type })); const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 4000);
+    note.textContent = `Saved as ${name}. Check your Downloads folder, then give the file to the researcher.`; }
+  catch { area.hidden = false; area.value = text; area.select(); note.textContent = 'Downloading is blocked here. Copy the text in the box and give it to the researcher.'; }
+}
+$('save-json').addEventListener('click', async () => { $('save-note').textContent = 'Preparing your file…'; const f = await participantFile(); saveForParticipant(`speaking_${S.pid || 'nopid'}_${S.sessionId}.json`, JSON.stringify(f, null, 2), 'application/json'); });
+$('save-csv').addEventListener('click', () => saveForParticipant(`speaking_${S.pid || 'nopid'}_${S.sessionId}.csv`, Log.csv([Log.record()]), 'text/csv'));
 const stamp = () => `${S.pid || 'nopid'}_${S.sessionId}`;
 $('rv-dl-json').addEventListener('click', () => download(`speaking_${stamp()}.json`, JSON.stringify(Log.full(), null, 2), 'application/json'));
 $('rv-dl-csv').addEventListener('click', () => download(`speaking_${stamp()}.csv`, Log.csv([Log.record()]), 'text/csv'));

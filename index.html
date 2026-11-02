@@ -865,32 +865,45 @@ const Reflect = {
     const pro = /should (be )?(required|mandatory|compulsory|enforced)|should (require|mandate)|must (be )?(required|mandatory)|attendance is (important|necessary|essential)/.test(t);
     return pro && !against ? 'for' : against && !pro ? 'against' : '';   // ambiguous -> no stance reflection
   },
-  topic(t) {
-    let best = null;
-    for (const tp of this.topics) { const m = tp.re.exec(t); if (m && (!best || m.index < best.index)) best = { ...tp, index: m.index }; }
-    return best;   // earliest-mentioned topic
+  stop: new Set(('about also because being could doing every from have having just like maybe more most much other really should something still such than that their them then there these they thing things think this those very want were what when where which while with would your people attendance university universities class classes students student mandatory required require everyone anyone someone because however though although actually basically').split(' ')),
+  topics2(t) {   // up to two distinct topics, in order of first mention
+    const hits = [];
+    for (const tp of this.topics) { const m = tp.re.exec(t); if (m) hits.push({ ...tp, index: m.index }); }
+    return hits.sort((x, y) => x.index - y.index).slice(0, 2);
   },
+  keyword(t) {   // fallback: most frequent content word (length >= 6, or repeated), so the agent still reflects something from the answer
+    const c = {}; (t.match(/[a-z']+/g) || []).forEach((w, i) => { if (w.length >= 5 && !this.stop.has(w)) { c[w] = c[w] || { n: 0, i }; c[w].n++; } });
+    const best = Object.entries(c).filter(([w, v]) => v.n >= 2 || w.length >= 7).sort((x, y) => y[1].n - x[1].n || x[1].i - y[1].i)[0];
+    return best ? best[0] : '';
+  },
+  join: a => a.length > 1 ? `${a[0]} and ${a[1]}` : a[0],
   build(id) {
     const r = S.responses.find(x => x.id === id), t = this.clean(r && r.asrText);
-    const enough = t.split(/\s+/).filter(Boolean).length >= 6;
+    const enough = t.split(/\s+/).filter(Boolean).length >= 4;
     const stance = enough && id === 'main' ? this.stance(t) : '';
-    const tp = enough ? this.topic(t) : null, ph = tp && tp.phrase;
+    const tps = enough ? this.topics2(t) : [];
+    const ph = tps.length ? this.join(tps.map(x => x.phrase)) : '';
+    const kw = enough && !tps.length ? this.keyword(t) : '';
     const st = stance === 'for' ? 'should be required' : 'should not be required';
+    const plural = tps.length > 1;
     let text, kind;
     if (id === 'main') {
       const tail = ' I have a couple of follow-up questions.';
-      if (stance && tp)  { kind = 'stance+topic'; text = `Okay. So you think attendance ${st}, and ${ph} was part of your reasoning.${tail}`; }
+      if (stance && ph)  { kind = 'stance+topic'; text = `Okay. So you think attendance ${st}, and ${ph} ${plural ? 'were' : 'was'} part of your reasoning.${tail}`; }
       else if (stance)   { kind = 'stance';       text = `Okay. So you think attendance ${st}.${tail}`; }
-      else if (tp)       { kind = 'topic';        text = `Okay. ${this.cap(ph)} was part of what you talked about.${tail}`; }
+      else if (ph)       { kind = 'topic';        text = `Okay. ${this.cap(ph)} ${plural ? 'were' : 'was'} part of what you talked about.${tail}`; }
+      else if (kw)       { kind = 'keyword';      text = `Okay. You talked quite a bit about ${kw}.${tail}`; }
       else               { kind = 'generic';      text = `Okay, thank you.${tail}`; }
     } else if (id === 'follow1') {
-      if (tp) { kind = 'topic'; text = `Okay. So ${ph} is the main reason you gave. Here is the next question.`; }
-      else    { kind = 'generic'; text = 'Okay, thank you. Here is the next question.'; }
+      if (ph)      { kind = 'topic';   text = `Okay. So ${ph} ${plural ? 'are' : 'is'} what you pointed to as your strongest reason. Here is the next question.`; }
+      else if (kw) { kind = 'keyword'; text = `Okay. In explaining your reason, you focused on ${kw}. Here is the next question.`; }
+      else         { kind = 'generic'; text = 'Okay, thank you. Here is the next question.'; }
     } else {
-      if (tp) { kind = 'topic'; text = `Okay. ${this.cap(ph)} is part of how you would respond to them.`; }
-      else    { kind = 'generic'; text = 'Okay, thank you.'; }
+      if (ph)      { kind = 'topic';   text = `Okay. So to someone who disagrees, you would bring up ${ph}.`; }
+      else if (kw) { kind = 'keyword'; text = `Okay. In responding to them, you focused on ${kw}.`; }
+      else         { kind = 'generic'; text = 'Okay, thank you.'; }
     }
-    return { text, kind, stance, topic: tp ? tp.id : '' };
+    return { text, kind, stance, topic: tps.map(x => x.id).join('+') || kw };
   },
 };
 

@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<!--
+  Evaluator or Conversational Partner? Live self-transcription study prototype
+  ----------------------------------------------------------------------------
+  Single-file prototype (M. Boloni). Randomized 2 x 2 between-subjects design:
+    Factor 1, agent role:        partner | evaluator      (only the agent's introduction differs)
+    Factor 2, live transcript:   absent  | visible        (only the content of the "Your speech" panel differs)
+
+  RUNNING IT
+    Use Google Chrome or Microsoft Edge on a computer, with headphones (so the recognizer never hears the agent).
+    Serve the file from localhost for reliable microphone access:  python3 -m http.server 8000  ->  http://localhost:8000/speaking_study.html
+    Speech recognition uses the browser's Web Speech API. In Chrome, audio is sent to Google's speech service:
+    disclose this in the consent form or replace the ASR adapter with a local recognizer.
+
+  Architecture:
+    0. CONFIG       timing, agent identity, prompt, pause-coding rule, nod rule
+    1. CONDITIONS   2 x 2 cells; opaque codes in the data
+    2. SCRIPT       agent turns; only the introduction differs by role
+    3. AUDIO        microphone, calibration, frame-level voice activity, MediaRecorder per response
+    4. ASR          Web Speech API, run in EVERY condition so processing and logging are identical
+    5. METRICS      latency, silent pauses, long pauses, filled pauses (from ASR), words, rates, duration, abandonment, agent nods
+    6. MEASURES     demographics, post-interaction constructs (draft items), manipulation checks from the document
+    7. Logger / 8. UI / 9. Controller (includes Nod and Reflect: the same listening behavior in every cell)
+-->
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speaking Study</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  /* Layout idea: a video-call style stage. The agent on the left, the task and a fixed "Your speech" panel on the right.
+     The panel occupies the same place and size in every condition; only its content changes with the transcript factor. */
+  :root {
+    --bg: #eceef1; --surface: #ffffff; --surface-2: #f5f6f8; --text: #1c2229; --muted: #56616d; --border: #d3d8de;
+    --accent: #3d4f7a; --accent-soft: #e8ecf5; --accent-line: #bac4dd; --rec: #b3261e; --ok: #2d6a4f;
+    --focus: #1f6feb; --warn: #b3261e;
+    --research-bg: #fff7dc; --research-line: #9a7400; --research-text: #3b2f00;
+    --radius: 10px; --radius-sm: 6px; --header-h: 56px; color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #14181c; --surface: #1c2227; --surface-2: #232a30; --text: #e7eaed; --muted: #a3adb7; --border: #38424b;
+    --accent: #a9b8e0; --accent-soft: #232a3b; --accent-line: #44517a; --rec: #ff8a80; --ok: #7cc4a0; --focus: #6ea8ff; --warn: #ff8a80;
+    --research-bg: #2c2610; --research-line: #c9a227; --research-text: #f3e7b8; color-scheme: dark; } }
+  :root[data-theme="dark"] {
+    --bg: #14181c; --surface: #1c2227; --surface-2: #232a30; --text: #e7eaed; --muted: #a3adb7; --border: #38424b;
+    --accent: #a9b8e0; --accent-soft: #232a3b; --accent-line: #44517a; --rec: #ff8a80; --ok: #7cc4a0; --focus: #6ea8ff; --warn: #ff8a80;
+    --research-bg: #2c2610; --research-line: #c9a227; --research-text: #f3e7b8; color-scheme: dark; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: "Public Sans", "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+    font-size: 17px; line-height: 1.5; display: flex; flex-direction: column; min-height: 100%; }
+  body.researcher-open { padding-right: min(460px, 42vw); }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  [hidden] { display: none !important; }
+
+  .study-header { flex: none; min-height: var(--header-h); display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 8px 20px; background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .study-title { font-size: 1.05rem; font-weight: 700; }
+  .study-title span { font-weight: 400; color: var(--muted); margin-left: 8px; }
+  .header-right { display: flex; align-items: center; gap: 16px; }
+  .progress { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; white-space: nowrap; }
+  .progress-steps { display: flex; gap: 4px; }
+  .progress-steps i { width: 22px; height: 6px; border-radius: 3px; background: var(--border); }
+  .progress-steps i.done { background: var(--accent); }
+  .progress-steps i.current { background: var(--accent-line); outline: 1px solid var(--accent); }
+  .researcher-toggle { font-size: 0.78rem; padding: 4px 9px; border-radius: var(--radius-sm); border: 1px dashed var(--research-line); background: transparent; color: var(--muted); cursor: pointer; }
+  .btn { padding: 10px 22px; border-radius: var(--radius-sm); border: 1px solid var(--accent); background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
+  .btn.secondary { background: var(--surface); color: var(--accent); }
+  :root[data-theme="dark"] .btn:not(.secondary) { color: #10161b; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .page { flex: 1; padding: 28px 16px 48px; overflow-y: auto; }
+  .page-card { width: min(760px, 100%); margin: 0 auto; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px 32px 26px; }
+  .kicker { margin: 0; color: var(--muted); font-size: 0.86rem; }
+  .page-title { margin: 2px 0 10px; font-size: 1.5rem; line-height: 1.25; font-weight: 700; text-wrap: balance; }
+  .page-card p { margin: 0 0 10px; }
+  .goal-box { margin: 16px 0 0; padding: 12px 16px; background: var(--accent-soft); border-left: 4px solid var(--accent); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+  .goal-box h2, .h2 { margin: 0 0 4px; font-size: 1.02rem; font-weight: 700; }
+  .goal-box p { margin: 0; }
+  .h2 { margin-top: 18px; }
+  .steps { margin: 4px 0 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 8px; font-size: 0.96rem; }
+  .steps li::marker { font-weight: 700; color: var(--accent); }
+  .actions { margin-top: 22px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+  .hint { color: var(--muted); font-size: 0.88rem; flex: 1; min-width: 200px; }
+  .field { display: grid; gap: 6px; margin-top: 16px; }
+  .field > label { font-weight: 700; }
+  .text-field { padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); max-width: 320px; }
+  .consent { display: flex; gap: 10px; align-items: flex-start; margin-top: 18px; font-size: 0.96rem; }
+  .consent input { width: 20px; height: 20px; margin-top: 2px; flex: none; }
+  .error-note { color: var(--warn); font-size: 0.9rem; min-height: 1.3em; margin: 10px 0 0; }
+  .warn-box { margin-top: 14px; padding: 10px 14px; border-left: 4px solid var(--warn); background: rgba(179,38,30,0.06); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; font-size: 0.94rem; }
+
+  .q-block { border: 0; margin: 18px 0 0; padding: 0; }
+  .q-instr { color: var(--muted); font-size: 0.92rem; margin: 0 0 8px; }
+  .likert { border: 0; margin: 0; padding: 14px 0; border-top: 1px solid var(--border); display: grid; gap: 8px; }
+  .likert:last-child { border-bottom: 1px solid var(--border); }
+  .likert.missing, .choice-field.missing { background: linear-gradient(90deg, rgba(179,38,30,0.07), transparent 70%); border-left: 3px solid var(--warn); padding-left: 10px; }
+  .likert legend { float: left; width: 100%; padding: 0; margin-bottom: 8px; font-size: 0.98rem; }
+  .scale { display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); gap: 6px; clear: both; }
+  .scale label { position: relative; display: grid; place-items: center; min-height: 40px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); cursor: pointer; font-weight: 700; }
+  .scale input { position: absolute; opacity: 0; inset: 0; cursor: pointer; margin: 0; }
+  .scale label:has(input:checked) { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .scale label:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .anchors { display: flex; justify-content: space-between; gap: 12px; font-size: 0.8rem; color: var(--muted); }
+  .choice-field { border: 0; margin: 18px 0 0; padding: 0; }
+  .choice-field legend { font-weight: 700; margin-bottom: 6px; padding: 0; }
+  .choice-list { display: grid; gap: 8px; }
+  .choice-list label { display: flex; gap: 10px; align-items: center; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; background: var(--surface-2); }
+  .choice-list label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+
+  /* Mic check */
+  .meter-big { height: 14px; border-radius: 7px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+  .meter-big i { display: block; height: 100%; width: 0; background: var(--ok); transition: width 60ms linear; }
+  .check-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+  .check-list li { display: flex; gap: 10px; align-items: center; }
+  .check-list li::before { content: ""; width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border); flex: none; }
+  .check-list li.ok::before { background: var(--ok); border-color: var(--ok); }
+  .check-list li.bad::before { background: var(--warn); border-color: var(--warn); }
+
+  /* Session stage */
+  .stage { flex: 1; min-height: 0; display: grid; gap: 14px; padding: 14px; height: calc(100vh - var(--header-h));
+    grid-template-columns: minmax(300px, 1fr) minmax(360px, 1fr); max-width: 1280px; width: 100%; margin: 0 auto; }
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); min-height: 0; }
+  .agent-stage { display: flex; flex-direction: column; overflow: hidden; }
+  .agent-embodiment { position: relative; flex: 1; min-height: 260px; overflow: hidden; border-radius: var(--radius) var(--radius) 0 0;
+    background: linear-gradient(180deg, #dfe5f1 0%, #eef1f7 100%); }
+  .agent-embodiment svg.vh { position: absolute; left: 50%; bottom: 0; height: 92%; transform: translateX(-50%); }
+  .agent-embodiment img { width: 100%; height: 100%; object-fit: cover; object-position: center 25%; display: block; }
+  .vh .body { animation: breathe 4.5s ease-in-out infinite; transform-origin: 100px 240px; }
+  .vh .head { transition: transform 300ms ease; transform-origin: 100px 150px; transform-box: view-box; }
+  /* Listening nod: triggered by the Nod controller (class "nodding"), one short nod per trigger. */
+  .agent-embodiment.nodding .vh .head { animation: nod 0.8s ease-in-out 1; }
+  .agent-embodiment.nodding img { animation: nod-img 0.8s ease-in-out 1; }
+  .vh .eye { transform-box: fill-box; transform-origin: center; animation: blink 5.2s infinite; }
+  .vh .mouth-open { transform-box: fill-box; transform-origin: center; transform: scaleY(0.15); }
+  .agent-embodiment[data-state="speaking"] .vh .mouth-open { animation: talk 0.24s ease-in-out infinite alternate; }
+  @keyframes blink { 0%, 95%, 100% { transform: scaleY(1); } 97% { transform: scaleY(0.1); } }
+  @keyframes talk { from { transform: scaleY(0.2); } to { transform: scaleY(1); } }
+  @keyframes breathe { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1.5px); } }
+  @keyframes nod { 0%, 100% { transform: rotate(0) translateY(0); } 30% { transform: rotate(2.5deg) translateY(5px); } 55% { transform: rotate(0) translateY(0); } 75% { transform: rotate(1.5deg) translateY(3px); } }
+  @keyframes nod-img { 0%, 100% { transform: translateY(0); } 35% { transform: translateY(6px); } 65% { transform: translateY(0); } }
+  @media (prefers-reduced-motion: reduce) { .vh .body, .vh .eye, .agent-embodiment.nodding .vh .head, .agent-embodiment.nodding img { animation: none; }
+    .agent-embodiment[data-state="speaking"] .vh .mouth-open { animation: none; transform: scaleY(0.6); } }
+  .name-tag { position: absolute; left: 16px; bottom: 14px; background: rgba(23,33,63,0.78); color: #fff; font-weight: 700; font-size: 0.98rem;
+    padding: 5px 14px; border-radius: 999px; white-space: nowrap; }
+  .name-tag small { font-weight: 400; opacity: 0.85; margin-left: 6px; }
+  .caption { flex: none; min-height: 5.2em; padding: 12px 18px; border-top: 1px solid var(--border); font-size: 1.02rem; display: flex; gap: 10px; align-items: flex-start; }
+  .caption b { color: var(--accent); flex: none; }
+  .caption span:empty::before { content: "…"; color: var(--muted); }
+
+  .task-side { display: grid; grid-template-rows: auto auto 1fr; gap: 14px; min-height: 0; }
+  .task-card { padding: 16px 18px; display: grid; gap: 8px; }
+  .phase { font-size: 0.82rem; color: var(--muted); }
+  .prompt { font-size: 1.06rem; font-weight: 600; line-height: 1.45; margin: 0; }
+  .prompt.empty { color: var(--muted); font-weight: 400; }
+  .status-bar { display: flex; align-items: center; gap: 12px; padding: 12px 18px; flex-wrap: wrap; }
+  .rec-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--border); flex: none; }
+  .rec-dot.on { background: var(--rec); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) { .rec-dot.on { animation: none; } }
+  .status-text { font-weight: 700; }
+  .timer { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 1.3rem; font-weight: 700; }
+  .speech-panel { display: flex; flex-direction: column; overflow: hidden; }
+  .speech-head { flex: none; padding: 10px 18px; border-bottom: 1px solid var(--border); font-size: 0.86rem; color: var(--muted); display: flex; justify-content: space-between; }
+  .speech-body { flex: 1; min-height: 140px; overflow-y: auto; padding: 14px 18px; font-size: 1.08rem; line-height: 1.6; }
+  .speech-body .interim { color: var(--muted); }
+  .speech-body .turn-sep { display: block; margin: 8px 0 4px; font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .neutral-fill { height: 100%; display: grid; place-items: center; color: var(--muted); font-size: 0.95rem; text-align: center;
+    background: repeating-linear-gradient(135deg, transparent 0 14px, rgba(61,79,122,0.04) 14px 28px); border-radius: var(--radius-sm); }
+  .sim-box { flex: none; padding: 10px 18px; border-top: 1px dashed var(--research-line); background: var(--research-bg); color: var(--research-text); display: grid; gap: 6px; font-size: 0.84rem; }
+  .sim-box textarea { width: 100%; min-height: 60px; border: 1px solid var(--research-line); border-radius: 4px; background: transparent; }
+  .speech-foot { flex: none; padding: 12px 18px; border-top: 1px solid var(--border); background: var(--surface-2); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+  /* Researcher view */
+  .researcher-panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 42vw); background: var(--research-bg); color: var(--research-text);
+    border-left: 3px solid var(--research-line); overflow-y: auto; font-size: 0.8rem; line-height: 1.4; z-index: 20; }
+  .researcher-panel header { position: sticky; top: 0; z-index: 1; background: repeating-linear-gradient(135deg, var(--research-bg) 0 12px, rgba(154,116,0,0.12) 12px 24px);
+    border-bottom: 1px solid var(--research-line); padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .researcher-panel section { padding: 10px 14px; border-bottom: 1px solid rgba(154,116,0,0.35); }
+  .researcher-panel h3 { margin: 0 0 6px; font-size: 0.85rem; }
+  .researcher-panel pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.74rem; }
+  .researcher-panel .kv { display: grid; grid-template-columns: 140px 1fr; gap: 2px 8px; }
+  .researcher-panel button { font-size: 0.78rem; padding: 4px 8px; border: 1px solid var(--research-line); background: transparent; border-radius: 4px; cursor: pointer; color: inherit; }
+  .researcher-panel input[type="text"], .researcher-panel input[type="number"], .researcher-panel select { font-size: 0.78rem; padding: 3px 6px; width: 100%; border: 1px solid var(--research-line); background: transparent; color: inherit; border-radius: 4px; }
+  .researcher-panel .row { display: grid; grid-template-columns: 130px 1fr; gap: 6px 8px; align-items: center; margin-bottom: 6px; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .rv-note { margin: 4px 0 8px; padding: 6px 8px; border-left: 3px solid var(--research-line); background: rgba(154,116,0,0.08); }
+  .rv-note:empty { display: none; }
+  .rv-note.warn { border-left-color: #b3261e; background: rgba(179,38,30,0.08); }
+  .mtable { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .mtable th, .mtable td { text-align: right; padding: 2px 4px; border-top: 1px dashed rgba(154,116,0,0.4); }
+  .mtable th:first-child, .mtable td:first-child { text-align: left; }
+  .log-entry { border-top: 1px dashed rgba(154,116,0,0.4); padding: 6px 0; }
+  .log-entry:first-child { border-top: 0; }
+  .tag { display: inline-block; padding: 0 6px; border: 1px solid var(--research-line); border-radius: 3px; margin-right: 4px; }
+  .copy-area { width: 100%; height: 90px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.7rem; background: transparent; color: inherit; border: 1px dashed var(--research-line); margin-top: 6px; }
+
+  @media (max-width: 900px) {
+    .stage { height: auto; grid-template-columns: minmax(0, 1fr); }
+    .agent-embodiment { min-height: 240px; }
+    .speech-panel { min-height: 300px; }
+  }
+  @media (max-width: 760px) {
+    body.researcher-open { padding-right: 0; }
+    .researcher-panel { width: 100%; top: 45%; border-left: 0; border-top: 3px solid var(--research-line); }
+    .study-title span, .progress-steps { display: none; }
+    .page-card { padding: 20px 18px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="study-header">
+  <div class="study-title">Speaking Study<span>Conversation with a virtual human</span></div>
+  <div class="header-right">
+    <div class="progress" aria-live="polite"><span class="progress-steps" id="progress-steps" aria-hidden="true"></span><span id="progress"></span></div>
+    <button id="researcher-toggle" class="researcher-toggle" type="button" hidden>Researcher View</button>
+  </div>
+</header>
+
+<!-- SCREEN 1: Consent. Identical in every condition; role framing happens only in the agent's introduction. -->
+<main id="screen-intro" class="page">
+  <div class="page-card">
+    <p class="kicker">Before you begin</p>
+    <h1 class="page-title">A spoken conversation with a virtual human</h1>
+    <p>In this study you will talk out loud with a virtual human on your screen. You will be given a topic, a minute to think, and then you will speak your answer. The virtual human will then ask two short follow-up questions.</p>
+    <div class="goal-box">
+      <h2>What you need</h2>
+      <p>A quiet room, headphones, and a working microphone. Your voice will be recorded for later analysis.</p>
+    </div>
+    <h2 class="h2">How the session works</h2>
+    <ol class="steps">
+      <li><b>A few questions about you.</b> About 2 minutes.</li>
+      <li><b>A quick microphone check.</b> About 1 minute.</li>
+      <li><b>The conversation.</b> About 6 minutes.</li>
+      <li><b>Questions about the conversation.</b> About 4 minutes.</li>
+    </ol>
+    <div id="browser-warning" class="warn-box" hidden>This browser does not support speech recognition. Please use Google Chrome or Microsoft Edge on a computer.</div>
+    <div class="field"><label for="pid">Participant ID</label><input id="pid" class="text-field" type="text" autocomplete="off" placeholder="Provided by the researcher"></div>
+    <label class="consent"><input id="consent" type="checkbox"> <span>I have read the study information, I am 18 or older, and I agree to take part and to have my voice recorded.</span></label>
+    <p id="intro-error" class="error-note" aria-live="polite"></p>
+    <div class="actions"><button id="intro-start" class="btn" type="button">Begin</button><span class="hint">Your responses are stored with your participant ID only.</span></div>
+  </div>
+</main>
+
+<!-- SCREEN 2: Demographics and speaking experience -->
+<main id="screen-pre" class="page" hidden>
+  <div class="page-card">
+    <p class="kicker">Part 1 · About you</p>
+    <h1 class="page-title">A few questions about you</h1>
+    <form id="pre-form" novalidate></form>
+    <p id="pre-error" class="error-note" aria-live="polite"></p>
+    <div class="actions"><button id="pre-next" class="btn" type="button">Continue</button></div>
+  </div>
+</main>
+
+<!-- SCREEN 3: Microphone check. Identical in every condition and never shows recognized text. -->
+<main id="screen-mic" class="page" hidden>
+  <div class="page-card">
+    <p class="kicker">Part 2 · Microphone check</p>
+    <h1 class="page-title">Let’s check your microphone</h1>
+    <p>Put on your headphones. When your browser asks, allow microphone access.</p>
+    <ol class="steps">
+      <li>Stay quiet for three seconds while we measure the room.</li>
+      <li>Then say: <b>“Testing, one, two, three. The weather is nice today.”</b></li>
+    </ol>
+    <div class="field"><span class="q-instr" style="margin:0">Microphone level</span><div class="meter-big"><i id="mic-level"></i></div></div>
+    <ul class="check-list">
+      <li id="chk-perm">Microphone allowed</li>
+      <li id="chk-quiet">Room measured</li>
+      <li id="chk-voice">Your voice detected</li>
+      <li id="chk-asr">Your speech recognized</li>
+    </ul>
+    <p id="mic-error" class="error-note" aria-live="polite"></p>
+    <div class="actions">
+      <button id="mic-start" class="btn" type="button">Start microphone check</button>
+      <button id="mic-next" class="btn" type="button" disabled>Continue to the conversation</button>
+    </div>
+  </div>
+</main>
+
+<!-- SCREEN 4: Conversation -->
+<main id="screen-chat" class="stage" hidden>
+  <section class="panel agent-stage" aria-label="Virtual human">
+    <div id="agent-embodiment" class="agent-embodiment" data-state="idle">
+      <svg class="vh" id="vh" viewBox="0 0 200 250" aria-hidden="true">
+        <g class="body">
+          <path d="M14 250 C16 200 54 182 100 182 C146 182 184 200 186 250 Z" fill="#3c5a8a"/>
+          <path d="M80 184 L100 214 L120 184 Z" fill="#f1f3f7"/>
+          <rect x="86" y="146" width="28" height="44" rx="12" fill="#c98f6b"/>
+          <g class="head">
+            <ellipse cx="54" cy="112" rx="8" ry="12" fill="#d89c76"/><ellipse cx="146" cy="112" rx="8" ry="12" fill="#d89c76"/>
+            <ellipse cx="100" cy="106" rx="46" ry="56" fill="#e2a982"/>
+            <path d="M53 104 C46 54 78 36 104 38 C134 40 156 60 147 104 C143 84 130 70 102 69 C80 69 62 80 53 104 Z" fill="#2f241f"/>
+            <path d="M73 92 Q83 87 92 91" stroke="#2f241f" stroke-width="3.2" fill="none" stroke-linecap="round"/>
+            <path d="M108 91 Q117 87 127 92" stroke="#2f241f" stroke-width="3.2" fill="none" stroke-linecap="round"/>
+            <ellipse class="eye" cx="83" cy="106" rx="5" ry="6" fill="#2a1f1a"/><ellipse class="eye" cx="117" cy="106" rx="5" ry="6" fill="#2a1f1a"/>
+            <circle cx="85" cy="104" r="1.4" fill="#fff"/><circle cx="119" cy="104" r="1.4" fill="#fff"/>
+            <path d="M100 110 Q96 124 101 126" stroke="#b57c5a" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+            <ellipse class="mouth-open" cx="100" cy="140" rx="10" ry="5" fill="#7d3530"/>
+            <path d="M88 138 Q100 146 112 138" stroke="#9c4a40" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+          </g>
+        </g>
+      </svg>
+      <img id="agent-img" alt="" hidden>
+      <div class="name-tag"><span data-agent-name></span><small id="role-label"></small></div>
+    </div>
+    <div class="caption" aria-live="polite"><b data-agent-name></b><span id="caption"></span></div>
+  </section>
+
+  <div class="task-side">
+    <section class="panel task-card" aria-labelledby="phase">
+      <div class="phase" id="phase">Waiting to start</div>
+      <p class="prompt empty" id="prompt">The topic will appear here.</p>
+    </section>
+    <section class="panel status-bar" aria-live="polite">
+      <span class="rec-dot" id="rec-dot" aria-hidden="true"></span>
+      <span class="status-text" id="status-text">Not recording</span>
+      <span class="timer" id="timer" aria-label="Time"></span>
+    </section>
+    <section class="panel speech-panel" aria-labelledby="speech-title">
+      <div class="speech-head"><span id="speech-title">Your speech</span><span id="speech-sub"></span></div>
+      <div class="speech-body" id="speech-body"></div>
+      <div class="sim-box" id="sim-box" hidden>
+        <label for="sim-input"><b>Pilot mode, no microphone:</b> type to simulate speech. Each word counts as spoken when you type it.</label>
+        <textarea id="sim-input"></textarea>
+      </div>
+      <div class="speech-foot">
+        <button id="done-btn" class="btn" type="button" disabled>I’m finished</button>
+        <button id="start-btn" class="btn" type="button" hidden>Start the conversation</button>
+        <span class="hint" id="foot-hint"></span>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- SCREEN 5: Post-interaction questionnaire -->
+<main id="screen-post" class="page" hidden>
+  <div class="page-card">
+    <p class="kicker" id="post-kicker"></p>
+    <h1 class="page-title" id="post-title"></h1>
+    <p id="post-lead"></p>
+    <form id="post-form" novalidate></form>
+    <p id="post-error" class="error-note" aria-live="polite"></p>
+    <div class="actions"><button id="post-next" class="btn" type="button">Continue</button></div>
+  </div>
+</main>
+
+<!-- SCREEN 6: Done -->
+<main id="screen-done" class="page" hidden>
+  <div class="page-card">
+    <p class="kicker">Finished</p>
+    <h1 class="page-title">Thank you for taking part</h1>
+    <p>Your responses have been recorded. Please let the researcher know you are finished.</p>
+    <p id="done-code"></p>
+    <div class="actions" id="done-actions"></div>
+  </div>
+</main>
+
+<!-- Researcher view -->
+<aside id="researcher-panel" class="researcher-panel" hidden aria-label="Researcher view">
+  <header><strong>Researcher view: not visible to participants</strong>
+    <span class="btn-row"><button type="button" id="rv-reset">New session</button><button type="button" id="rv-close">Close</button></span></header>
+  <section>
+    <h3>Condition (2 × 2)</h3>
+    <div class="row"><label for="rv-role">Agent role</label><select id="rv-role"><option value="partner">Conversational partner</option><option value="evaluator">Evaluator</option></select></div>
+    <div class="row"><label for="rv-tx">Live transcript</label><select id="rv-tx"><option value="absent">Absent</option><option value="visible">Visible</option></select></div>
+    <div class="row"><span>Cell / assigned by</span><span id="rv-assigned"></span></div>
+    <div class="row"><span>Restart as</span><span class="btn-row">
+      <button type="button" data-restart="partner,absent">C1 Partner</button><button type="button" data-restart="partner,visible">C2 Partner + T</button>
+      <button type="button" data-restart="evaluator,absent">C3 Evaluator</button><button type="button" data-restart="evaluator,visible">C4 Evaluator + T</button></span></div>
+    <div id="rv-cond-note" class="rv-note"></div>
+    <div class="rv-note">Test links: <b>#c1</b> to <b>#c4</b> (or <b>#partner</b>/<b>#evaluator</b> with <b>#visible</b>/<b>#absent</b>). <b>#pilot</b> skips the questionnaires and uses short timings. <b>#sim</b> uses typed speech instead of the microphone.</div>
+  </section>
+  <section>
+    <h3>Pilot settings</h3>
+    <div class="row"><label for="rv-skip">Questionnaires</label><select id="rv-skip"><option value="no">Shown (real session)</option><option value="yes">Skipped</option></select></div>
+    <div class="row"><label for="rv-input">Speech input</label><select id="rv-input"><option value="mic">Microphone and recognition</option><option value="sim">Simulated (typed)</option></select></div>
+    <div class="row"><label for="rv-timing">Timings</label><select id="rv-timing"><option value="study">Study (60 s think, 120 s answer, 60 s follow-ups)</option><option value="short">Short pilot (10 s, 30 s, 20 s)</option></select></div>
+    <div class="row"><label for="rv-voice">Agent voice</label><select id="rv-voice"></select></div>
+    <div class="row"><label for="rv-name">Agent name</label><input id="rv-name" type="text"></div>
+    <div class="row"><label for="rv-avatar">Replace avatar</label><input id="rv-avatar" type="file" accept="image/*"></div>
+  </section>
+  <section><h3>Session</h3><div id="rv-session" class="kv"></div></section>
+  <section>
+    <h3>Speech measures per response</h3>
+    <div id="rv-metrics">(none yet)</div>
+    <div class="rv-note" id="rv-rule"></div>
+  </section>
+  <section>
+    <h3>Data</h3>
+    <div class="btn-row"><button type="button" id="rv-dl-json">Download JSON</button><button type="button" id="rv-dl-csv">Download CSV</button><button type="button" id="rv-dl-audio">Download audio</button>
+      <button type="button" id="rv-copy-json">Copy JSON</button><button type="button" id="rv-copy-csv">Copy CSV</button></div>
+    <div class="row" style="margin-top:8px"><span>On this device</span><span id="rv-device"></span></div>
+    <div class="btn-row"><button type="button" id="rv-dl-all">Download all sessions (CSV)</button><button type="button" id="rv-copy-all">Copy all sessions (CSV)</button><button type="button" id="rv-clear-all">Clear device data</button></div>
+    <div id="rv-data-note" class="rv-note"></div>
+    <textarea id="rv-copy-area" class="copy-area" readonly hidden aria-label="Exported data"></textarea>
+  </section>
+  <section><h3>Interaction log (newest first)</h3><div id="rv-log"></div></section>
+</aside>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   0. CONFIG
+   ===================================================================== */
+const CONFIG = {
+  studyId: 'agent_role_transcript_v1',
+  agent: { name: 'Alex', avatar: '' },
+  roleLabels: { partner: 'Conversation partner', evaluator: 'Communication evaluator' },  // shown under the name; same position in every cell
+  timing: {
+    study: { prepS: 60, mainS: 120, followS: 60, minS: 5 },
+    short: { prepS: 10, mainS: 30, followS: 20, minS: 2 },
+  },
+  prompt: 'Universities are considering whether class attendance should be mandatory. Do you think attendance should be required? Explain your position and give reasons or examples to support it.',
+  followUps: ['What is the strongest reason for your position?', 'What would you say to someone who disagrees with you?'],
+  /* Predefined pause-coding rule (study document: "A predefined rule should be used for identifying long pauses or breakdowns"). */
+  vad: {
+    frameMs: 20,              // analysis frame
+    thresholdFactor: 3.0,     // speech threshold = max(noise floor x factor, minThreshold)
+    minThreshold: 0.008,      // RMS floor for the threshold
+    minSpeechMs: 120,         // a speech segment must last at least this long (removes clicks)
+    silentPauseMs: 250,       // silence inside the response at least this long counts as a silent pause (Goldman-Eisler convention)
+    longPauseMs: 3000,        // silent pause at least this long counts as a long silence
+    abandonTrailingMs: 8000,  // response counts as abandoned if it ends after this much trailing silence, or contains no speech
+  },
+  /* Listening nods. Same rule in every cell: nod after a short pause that follows a stretch of speech, at most once per minGapMs. */
+  nod: { pauseMs: 450, minSpeechMs: 1200, minGapMs: 4000 },
+  fillers: ['um', 'uh', 'er', 'erm', 'ah', 'hmm', 'mm', 'uhm'],
+  asrLang: 'en-US',
+  showResearcherButton: true,
+  randomizeItems: true,
+  attentionCheck: true,
+  completionUrl: '',
+  storageKey: 'speaking_study_sessions_v1',
+};
+
+/* =====================================================================
+   1. CONDITIONS (2 x 2)
+   ===================================================================== */
+const CELLS = {
+  'partner,absent':    { code: 'C1', label: 'Partner + No transcript' },
+  'partner,visible':   { code: 'C2', label: 'Partner + Transcript' },
+  'evaluator,absent':  { code: 'C3', label: 'Evaluator + No transcript' },
+  'evaluator,visible': { code: 'C4', label: 'Evaluator + Transcript' },
+};
+const CELL_IDS = Object.keys(CELLS);
+
+/* =====================================================================
+   2. SCRIPT. Only the introduction differs by role (study document wording). Same voice, timing and questions in every cell.
+   Acknowledgments after each response are generated by the Reflect rule (section 9), which is identical in every cell
+   and never praises, criticizes, or comments on delivery.
+   ===================================================================== */
+const SCRIPT = {
+  intro: {
+    partner:   () => `Hi, I’m ${CONFIG.agent.name}. I would like to have a conversation with you about a topic most people know well. There are no right or wrong answers. I am interested in hearing what you think.`,
+    evaluator: () => `Hi, I’m ${CONFIG.agent.name}. In this conversation, I will evaluate your responses for clarity, fluency, confidence, and how effectively you communicate your ideas.`,
+  },
+  plan: () => 'First, I will give you a topic and one minute to think. Then you will speak for about two minutes, and I will ask you two follow-up questions.',
+  topic: () => `Here is the topic. ${CONFIG.prompt}`,
+  prep: () => 'You have one minute to think. I will tell you when to begin.',
+  begin: () => 'Please begin when you are ready.',
+  closing: () => 'Thank you. That is the end of our conversation.',
+};
+
+/* =====================================================================
+   6. MEASURES
+   Constructs follow the study document's Primary Measures table. Items marked draft were written for this prototype;
+   replace them with validated scales where available. Manipulation checks are the document's wording.
+   ===================================================================== */
+const AGREE7 = { n: 7, low: 'Strongly disagree', high: 'Strongly agree' };
+const PRE_CHOICES = [
+  { id: 'age', label: 'Your age', options: ['18 to 24', '25 to 34', '35 to 44', '45 to 54', '55 or older'] },
+  { id: 'gender', label: 'Your gender', options: ['Woman', 'Man', 'Non-binary', 'Prefer to self-describe', 'Prefer not to say'] },
+  { id: 'english_first', label: 'Is English your first language?', options: ['Yes', 'No'] },
+  { id: 'speak_groups', label: 'How often do you speak in front of a group (class, work, presentations)?', options: ['Rarely', 'A few times a year', 'Monthly', 'Weekly or more'] },
+  { id: 'speech_training', label: 'Have you had any public speaking or debate training?', options: ['None', 'Some', 'A lot'] },
+  { id: 'vh_experience', label: 'How often do you talk to voice assistants or virtual characters?', options: ['Never', 'Occasionally', 'Often'] },
+];
+const PRE_LIKERT = [
+  ['pre_anx', 'Speaking in front of others makes me nervous.'],
+  ['pre_conf', 'I am a confident speaker.'],
+];
+const POST_PAGES = [
+  { id: 'experience', kicker: 'Part 3 · Page 1 of 3', title: 'How the conversation felt', lead: 'Think about the time you were speaking.',
+    blocks: [
+      { id: 'anxiety', items: [['an1', 'I felt nervous while speaking.'], ['an2', 'I felt tense during the conversation.'], ['an3', 'I felt under pressure while responding.']] },
+      { id: 'confidence', items: [['cf1', 'I felt confident while responding.'], ['cf2', 'I felt comfortable expressing my ideas.'], ['cf3', 'I was able to say what I wanted to say.']] },
+      { id: 'difficulty', items: [['df1', 'At times my mind went blank while speaking.'], ['df2', 'I had difficulty finding the words I wanted.'], ['df3', 'It was hard to keep speaking at certain moments.']] },
+    ] },
+  { id: 'mechanisms', kicker: 'Part 3 · Page 2 of 3', title: 'Your attention while speaking', lead: 'Think about what you were paying attention to.', attention: true,
+    blocks: [
+      { id: 'apprehension', items: [['ea1', 'I was concerned about how the virtual human would judge my speaking.'], ['ea2', 'I worried about making a bad impression.'], ['ea3', 'I felt that my performance was being rated.']] },
+      { id: 'selffocus', items: [['sf1', 'While speaking, I paid close attention to how I was wording things.'], ['sf2', 'I was very aware of my own mistakes while speaking.'], ['sf3', 'I focused more on my own delivery than on what I wanted to say.']] },
+      { id: 'role', items: [['ro1', 'The virtual human seemed interested in my ideas.'], ['ro2', 'The virtual human’s main purpose was to judge my performance.']] },
+    ] },
+  { id: 'checks', kicker: 'Part 3 · Page 3 of 3', title: 'Last few questions', lead: 'How much do you agree with each statement?',
+    blocks: [
+      { id: 'manip_role', items: [['mc1', 'The virtual human was evaluating my speaking performance.'], ['mc2', 'I felt that the virtual human was judging how well I communicated.'], ['mc3', 'The virtual human felt like a conversational partner.']] },
+      { id: 'manip_tx', items: [['mc4', 'I noticed the live transcript of my speech while I was talking.'], ['mc5', 'I found myself looking at or thinking about the transcript while speaking.']] },
+      /* Shown only when the transcript was visible: addresses the memory-support and ASR-error validity threats. */
+      { id: 'tx_quality', onlyIf: 'visible', items: [['tq1', 'The transcript of my speech was accurate.'], ['tq2', 'Errors in the transcript distracted me.'], ['tq3', 'The transcript helped me keep track of what I had already said.']] },
+    ] },
+];
+const ATTENTION = ['attn', 'To show you are reading carefully, please select 2 for this statement.', 2];
+
+/* =====================================================================
+   SESSION STATE
+   ===================================================================== */
+const params = new URLSearchParams(location.search);
+const hashFlags = new Set(location.hash.replace(/^#/, '').toLowerCase().split(/[&,+]/).filter(Boolean));
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let S;
+function freshState() {
+  return {
+    sessionId: 'S' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), studyId: CONFIG.studyId,
+    pid: params.get('pid') || '', role: null, transcript: null, assignedBy: null, locked: false, interrupted: false,
+    skipSurveys: hashFlags.has('pilot') || params.get('pilot') === '1',
+    timingKey: hashFlags.has('pilot') ? 'short' : 'study',
+    sim: hashFlags.has('sim') || !SR,
+    screen: 'intro', phase: 'idle',
+    mic: { noiseFloor: null, threshold: null, permission: false, asrOk: false },
+    responses: [],   // one per response window: main, follow1, follow2
+    responsesQ: {}, itemOrder: {}, postPage: 0, attentionPassed: null,
+    times: { created: new Date().toISOString() }, turns: [], events: [], ttsVoice: '',
+  };
+}
+
+/* =====================================================================
+   3. AUDIO (microphone, calibration, voice activity, recording)
+   ===================================================================== */
+const Audio = {
+  stream: null, ctx: null, analyser: null, buf: null, timer: null, rms: 0, listeners: new Set(), recorder: null, chunks: [],
+  async open() {
+    if (this.stream) return;
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = this.ctx.createMediaStreamSource(this.stream);
+    this.analyser = this.ctx.createAnalyser(); this.analyser.fftSize = 1024; src.connect(this.analyser);
+    this.buf = new Float32Array(this.analyser.fftSize);
+    this.timer = setInterval(() => {
+      this.analyser.getFloatTimeDomainData(this.buf);
+      let s = 0; for (let i = 0; i < this.buf.length; i++) s += this.buf[i] * this.buf[i];
+      this.rms = Math.sqrt(s / this.buf.length);
+      const t = performance.now(); this.listeners.forEach(fn => fn(this.rms, t));
+    }, CONFIG.vad.frameMs);
+  },
+  onFrame(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
+  startRecording() {
+    if (!this.stream || !window.MediaRecorder) return false;
+    this.chunks = [];
+    try { this.recorder = new MediaRecorder(this.stream); } catch { return false; }
+    this.recorder.ondataavailable = e => { if (e.data.size) this.chunks.push(e.data); };
+    this.recorder.start(1000); return true;
+  },
+  stopRecording() {
+    return new Promise(res => {
+      if (!this.recorder || this.recorder.state === 'inactive') return res(null);
+      this.recorder.onstop = () => res(new Blob(this.chunks, { type: this.recorder.mimeType || 'audio/webm' }));
+      this.recorder.stop();
+    });
+  },
+};
+
+/* =====================================================================
+   4. ASR (runs in every condition; only the display depends on the transcript factor)
+   ===================================================================== */
+const ASR = {
+  rec: null, active: false, t0: 0, onUpdate: null, finals: [], interim: '', errors: [], restarts: 0,
+  start(t0, onUpdate) {
+    this.t0 = t0; this.onUpdate = onUpdate; this.finals = []; this.interim = ''; this.errors = []; this.restarts = 0; this.active = true;
+    if (!SR) return;
+    const make = () => {
+      const r = new SR(); r.lang = CONFIG.asrLang; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
+      r.onresult = e => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          if (res.isFinal) this.finals.push({ t: Math.round(performance.now() - this.t0), text: res[0].transcript.trim(), conf: +((res[0].confidence || 0).toFixed(3)) });
+          else interim += res[0].transcript;
+        }
+        this.interim = interim.trim(); this.onUpdate && this.onUpdate();
+      };
+      r.onerror = e => { this.errors.push(e.error); };
+      r.onend = () => { if (this.active) { this.restarts++; try { this.rec = make(); this.rec.start(); } catch {} } };
+      return r;
+    };
+    try { this.rec = make(); this.rec.start(); } catch (e) { this.errors.push(String(e)); }
+  },
+  stop() {
+    this.active = false;
+    return new Promise(res => {
+      if (!this.rec) return res();
+      const r = this.rec; const done = () => { clearTimeout(to); res(); }; const to = setTimeout(done, 1500);
+      r.onend = done; try { r.stop(); } catch { done(); }
+    });
+  },
+  text() { return this.finals.map(f => f.text).join(' ').trim(); },
+};
+
+/* =====================================================================
+   5. METRICS
+   ===================================================================== */
+function speechSegments(frames, thr) {
+  const v = CONFIG.vad, segs = []; let cur = null;
+  for (const [t, r] of frames) {
+    if (r >= thr) { if (!cur) cur = { s: t, e: t + v.frameMs }; else cur.e = t + v.frameMs; }
+    else if (cur && t - cur.e >= v.silentPauseMs) { segs.push(cur); cur = null; }
+  }
+  if (cur) segs.push(cur);
+  return segs.filter(s => s.e - s.s >= v.minSpeechMs);
+}
+function computeMetrics(resp) {
+  const v = CONFIG.vad, dur = resp.endT - resp.startT;
+  const words = (resp.asrText.match(/[A-Za-z0-9’']+/g) || []);
+  const fillers = words.filter(w => CONFIG.fillers.includes(w.toLowerCase())).length;
+  let segs;
+  if (resp.sim) segs = resp.simSegs;
+  else segs = speechSegments(resp.frames, S.mic.threshold || v.minThreshold);
+  const speakingMs = segs.reduce((a, s) => a + (s.e - s.s), 0);
+  const pauses = []; for (let i = 1; i < segs.length; i++) pauses.push(segs[i].s - segs[i - 1].e);
+  const sp = pauses.filter(p => p >= v.silentPauseMs);
+  const trailing = segs.length ? dur - segs[segs.length - 1].e : dur;
+  return {
+    duration_ms: Math.round(dur),
+    latency_ms: segs.length ? Math.round(segs[0].s) : '',
+    speaking_ms: Math.round(speakingMs),
+    phonation_ratio: dur ? +(speakingMs / dur).toFixed(3) : '',
+    silent_pauses: sp.length, silent_pause_ms: Math.round(sp.reduce((a, b) => a + b, 0)),
+    mean_pause_ms: sp.length ? Math.round(sp.reduce((a, b) => a + b, 0) / sp.length) : 0,
+    long_pauses: pauses.filter(p => p >= v.longPauseMs).length,
+    max_pause_ms: pauses.length ? Math.round(Math.max(...pauses)) : 0,
+    words: words.length, filled_pauses_asr: fillers,
+    speech_rate_wpm: dur ? +(words.length / (dur / 60000)).toFixed(1) : '',
+    articulation_wpm: speakingMs ? +(words.length / (speakingMs / 60000)).toFixed(1) : '',
+    trailing_silence_ms: Math.round(trailing),
+    abandoned: (!segs.length || (resp.endedBy === 'timeout' && trailing >= v.abandonTrailingMs) || (resp.endedBy === 'button' && trailing >= v.abandonTrailingMs)) ? 1 : 0,
+    agent_nods: resp.nods ?? 0,
+    ended_by: resp.endedBy, asr_restarts: resp.asrRestarts, asr_errors: resp.asrErrors.join('|'),
+  };
+}
+
+/* =====================================================================
+   7. LOGGER
+   ===================================================================== */
+const Log = {
+  event(type, data = {}) { S.events.push({ t: new Date().toISOString(), type, ...data }); UI.renderResearcher(); },
+  turn(e) { S.turns.push({ t: new Date().toISOString(), ...e }); UI.renderResearcher(); },
+  mean(ids) { const v = ids.map(id => S.responsesQ[id]).filter(x => typeof x === 'number'); return v.length ? +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(3) : ''; },
+  record() {
+    const cell = S.role ? CELLS[`${S.role},${S.transcript}`] : null;
+    const scores = {}; for (const p of POST_PAGES) for (const b of p.blocks) scores['score_' + b.id] = this.mean(b.items.map(i => i[0]));
+    const per = {};
+    for (const r of S.responses) for (const [k, v] of Object.entries(r.metrics || {})) per[`${r.id}_${k}`] = v;
+    for (const r of S.responses) per[`${r.id}_asr_text`] = r.asrText;
+    for (const r of S.responses) { per[`${r.id}_reflect_kind`] = r.reflect?.kind || ''; per[`${r.id}_reflect_topic`] = r.reflect?.topic || ''; per[`${r.id}_reflect_stance`] = r.reflect?.stance || ''; }
+    const totals = {};
+    if (S.responses.length) for (const k of ['words', 'silent_pauses', 'long_pauses', 'filled_pauses_asr', 'speaking_ms', 'duration_ms', 'abandoned', 'agent_nods'])
+      totals['total_' + k] = S.responses.reduce((a, r) => a + (+r.metrics?.[k] || 0), 0);
+    return {
+      study_id: S.studyId, session_id: S.sessionId, pid: S.pid, cell: cell ? cell.code : '', role: S.role, transcript: S.transcript, assigned_by: S.assignedBy,
+      skipped_surveys: S.skipSurveys, interrupted: S.interrupted ? 1 : 0, timing: S.timingKey, input: S.sim ? 'simulated' : 'microphone',
+      agent_name: CONFIG.agent.name, avatar: CONFIG.agent.avatar ? 'uploaded' : 'built-in', tts_voice: S.ttsVoice,
+      noise_floor: S.mic.noiseFloor ?? '', vad_threshold: S.mic.threshold ?? '', asr_check_ok: S.mic.asrOk ? 1 : 0,
+      started_at: S.times.created, chat_started_at: S.times.chatStart || '', chat_ended_at: S.times.chatEnd || '', finished_at: S.times.finished || '',
+      ...per, ...totals,
+      attention_passed: S.attentionPassed === null ? '' : S.attentionPassed,
+      ...scores, ...S.responsesQ,
+    };
+  },
+  full() {
+    return { record: this.record(), rule: CONFIG.vad, nodRule: CONFIG.nod, itemOrder: S.itemOrder, transcript_turns: S.turns, events: S.events,
+      responses: S.responses.map(r => ({ id: r.id, question: r.question, startedAt: r.startedAt, endedBy: r.endedBy, metrics: r.metrics, asrFinals: r.asrFinals,
+        reflect: r.reflect || null, segments: r.segments, audio: r.audioName || null })) };
+  },
+  csv(rows) {
+    const keys = []; rows.forEach(r => Object.keys(r).forEach(k => { if (!keys.includes(k)) keys.push(k); }));
+    const esc = v => { const s = v === undefined || v === null ? '' : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    return [keys.join(','), ...rows.map(r => keys.map(k => esc(r[k])).join(','))].join('\n');
+  },
+  device() { try { return JSON.parse(localStorage.getItem(CONFIG.storageKey) || '[]'); } catch { return []; } },
+  saveToDevice() { try { const all = this.device().filter(r => r.session_id !== S.sessionId); all.push(this.record()); localStorage.setItem(CONFIG.storageKey, JSON.stringify(all)); } catch {} },
+};
+
+function requestedCell() {
+  const map = { c1: 'partner,absent', c2: 'partner,visible', c3: 'evaluator,absent', c4: 'evaluator,visible' };
+  for (const k of Object.keys(map)) if (hashFlags.has(k)) return map[k];
+  const q = params.get('cond'); if (q && map[q.toLowerCase()]) return map[q.toLowerCase()];
+  const role = hashFlags.has('evaluator') ? 'evaluator' : hashFlags.has('partner') ? 'partner' : params.get('role');
+  const tx = hashFlags.has('visible') ? 'visible' : hashFlags.has('absent') ? 'absent' : params.get('transcript');
+  if (role && tx && CELLS[`${role},${tx}`]) return `${role},${tx}`;
+  return null;
+}
+function assign() {
+  const req = requestedCell(); if (req) return [req, 'address'];
+  const counts = Object.fromEntries(CELL_IDS.map(id => [id, 0]));
+  Log.device().forEach(r => { const k = `${r.role},${r.transcript}`; if (counts[k] !== undefined && r.finished_at && !r.skipped_surveys && !r.interrupted) counts[k]++; });
+  const min = Math.min(...Object.values(counts)); const pool = CELL_IDS.filter(id => counts[id] === min);
+  return [pool[Math.floor(Math.random() * pool.length)], 'balanced'];
+}
+
+/* =====================================================================
+   8. UI
+   ===================================================================== */
+const $ = id => document.getElementById(id);
+const SCREENS = ['intro', 'pre', 'mic', 'chat', 'post', 'done'];
+const STEP_LABELS = { intro: 'Consent', pre: 'About you', mic: 'Microphone check', chat: 'Conversation', post: 'Questions', done: 'Done' };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmt = s => `${Math.floor(s / 60)}:${String(Math.max(0, Math.floor(s % 60))).padStart(2, '0')}`;
+
+const UI = {
+  show(screen) {
+    S.screen = screen;
+    for (const s of SCREENS) $('screen-' + s).hidden = s !== screen;
+    const idx = SCREENS.indexOf(screen);
+    $('progress-steps').innerHTML = SCREENS.map((s, i) => `<i class="${i < idx ? 'done' : i === idx ? 'current' : ''}"></i>`).join('');
+    $('progress').textContent = `Step ${idx + 1} of ${SCREENS.length}: ${STEP_LABELS[screen]}`;
+    window.scrollTo(0, 0); document.querySelectorAll('.page').forEach(p => { p.scrollTop = 0; });
+    this.renderResearcher();
+  },
+  applyAgent() {
+    document.querySelectorAll('[data-agent-name]').forEach(el => { el.textContent = CONFIG.agent.name; });
+    $('role-label').textContent = S.role ? CONFIG.roleLabels[S.role] : '';
+    const img = $('agent-img');
+    if (CONFIG.agent.avatar) { img.src = CONFIG.agent.avatar; img.alt = CONFIG.agent.name; img.hidden = false; $('vh').style.display = 'none'; }
+    else { img.hidden = true; $('vh').style.display = ''; }
+  },
+  setAgent(state) { $('agent-embodiment').dataset.state = state; },
+  setPhase(text) { $('phase').textContent = text; },
+  setPrompt(text) { const p = $('prompt'); if (text) { p.textContent = text; p.classList.remove('empty'); } else { p.textContent = 'The topic will appear here.'; p.classList.add('empty'); } },
+  setStatus(rec, text, timer) { $('rec-dot').classList.toggle('on', rec); $('status-text').textContent = text; $('timer').textContent = timer ?? ''; },
+  /* The "Your speech" panel. Identical frame in every condition; transcript factor changes only its content. */
+  initSpeechPanel() {
+    const visible = S.transcript === 'visible';
+    $('speech-sub').textContent = visible ? 'Live transcript' : '';
+    $('speech-body').innerHTML = visible ? '' : '<div class="neutral-fill">Your response is being recorded.<br>Speak naturally.</div>';
+    $('sim-box').hidden = !S.sim;
+  },
+  renderTranscript(allResponses, current) {
+    if (S.transcript !== 'visible') return;
+    const body = $('speech-body');
+    let html = '';
+    for (const r of allResponses) html += `<span class="turn-sep">${esc(r.label)}</span>${esc(r.asrText)} `;
+    if (current) html += `<span class="turn-sep">${esc(current.label)}</span>${esc(current.text)} <span class="interim">${esc(current.interim)}</span>`;
+    body.innerHTML = html; body.scrollTop = body.scrollHeight;
+  },
+
+  likert(id, text) {
+    const n = AGREE7.n;
+    const opts = Array.from({ length: n }, (_, i) => i + 1).map(v => `<label><input type="radio" name="${id}" value="${v}" ${S.responsesQ[id] === v ? 'checked' : ''}><span aria-hidden="true">${v}</span><span class="sr-only">${v === 1 ? AGREE7.low : v === n ? AGREE7.high : v}</span></label>`).join('');
+    return `<fieldset class="likert" data-item="${id}"><legend>${text}</legend><div class="scale" style="--n:${n}">${opts}</div><div class="anchors" aria-hidden="true"><span>1 = ${AGREE7.low}</span><span>${n} = ${AGREE7.high}</span></div></fieldset>`;
+  },
+  choice(c) { return `<fieldset class="choice-field" data-item="${c.id}"><legend>${c.label}</legend><div class="choice-list">${c.options.map(o => `<label><input type="radio" name="${c.id}" value="${o}" ${S.responsesQ[c.id] === o ? 'checked' : ''}>${o}</label>`).join('')}</div></fieldset>`; },
+  renderPre() {
+    $('pre-form').innerHTML = PRE_CHOICES.map(c => this.choice(c)).join('') +
+      `<fieldset class="q-block"><legend class="sr-only">Speaking</legend><p class="q-instr">1 = ${AGREE7.low}, 7 = ${AGREE7.high}</p>${PRE_LIKERT.map(([id, t]) => this.likert(id, t)).join('')}</fieldset>`;
+  },
+  renderPost() {
+    const p = POST_PAGES[S.postPage];
+    $('post-kicker').textContent = p.kicker; $('post-title').textContent = p.title; $('post-lead').textContent = p.lead;
+    const items = p.blocks.filter(b => !b.onlyIf || b.onlyIf === S.transcript).flatMap(b => b.items);
+    if (!S.itemOrder[p.id]) {
+      const ids = items.map(i => i[0]);
+      if (CONFIG.randomizeItems) for (let i = ids.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [ids[i], ids[j]] = [ids[j], ids[i]]; }
+      if (p.attention && CONFIG.attentionCheck) ids.splice(2 + Math.floor(Math.random() * Math.max(1, ids.length - 4)), 0, ATTENTION[0]);
+      S.itemOrder[p.id] = ids;
+    }
+    const all = [...items, ATTENTION];
+    $('post-form').innerHTML = `<fieldset class="q-block"><legend class="sr-only">${p.title}</legend><p class="q-instr">1 = ${AGREE7.low}, 7 = ${AGREE7.high}</p>${S.itemOrder[p.id].map(id => { const it = all.find(i => i[0] === id); return this.likert(it[0], it[1]); }).join('')}</fieldset>`;
+    $('post-next').textContent = S.postPage === POST_PAGES.length - 1 ? 'Finish' : 'Continue';
+  },
+  collect(form) {
+    const missing = [];
+    form.querySelectorAll('[data-item]').forEach(el => {
+      const ch = el.querySelector('input:checked'); el.classList.toggle('missing', !ch);
+      if (!ch) missing.push(el); else S.responsesQ[el.dataset.item] = isNaN(+ch.value) ? ch.value : +ch.value;
+    });
+    if (missing.length) missing[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return missing.length;
+  },
+
+  renderResearcher() {
+    if ($('researcher-panel').hidden) return;
+    $('rv-role').value = S.role; $('rv-tx').value = S.transcript;
+    const cell = CELLS[`${S.role},${S.transcript}`];
+    $('rv-assigned').textContent = `${cell.code} · ${cell.label} · ${S.assignedBy}`;
+    $('rv-cond-note').textContent = S.locked ? 'The conversation has started. Changing the condition restarts it as a new session.' : 'Applies when the conversation starts.';
+    $('rv-skip').value = S.skipSurveys ? 'yes' : 'no'; $('rv-input').value = S.sim ? 'sim' : 'mic'; $('rv-timing').value = S.timingKey;
+    if (document.activeElement !== $('rv-name')) $('rv-name').value = CONFIG.agent.name;
+    const kv = { Session: S.sessionId, Participant: S.pid || '(none)', Screen: S.screen, Phase: S.phase,
+      'Speech recognition': SR ? 'available' : 'NOT available in this browser', Input: S.sim ? 'simulated (typed)' : 'microphone',
+      'Noise floor / threshold': S.mic.noiseFloor != null ? `${S.mic.noiseFloor.toFixed(4)} / ${S.mic.threshold.toFixed(4)}` : '',
+      'Agent voice': S.ttsVoice || '(default)', 'Attention check': S.attentionPassed ?? '' };
+    $('rv-session').innerHTML = Object.entries(kv).map(([k, v]) => `<span>${k}</span><span>${esc(v)}</span>`).join('');
+    const cols = [['latency_ms', 'Latency ms'], ['duration_ms', 'Duration ms'], ['speaking_ms', 'Speaking ms'], ['words', 'Words'], ['speech_rate_wpm', 'WPM'],
+      ['silent_pauses', 'Pauses ≥250'], ['long_pauses', 'Pauses ≥3s'], ['max_pause_ms', 'Max pause'], ['filled_pauses_asr', 'Fillers (ASR)'], ['abandoned', 'Abandoned'], ['agent_nods', 'Agent nods'], ['ended_by', 'Ended by']];
+    $('rv-metrics').innerHTML = S.responses.length ? `<table class="mtable"><thead><tr><th>Measure</th>${S.responses.map(r => `<th>${r.id}</th>`).join('')}</tr></thead><tbody>${cols.map(([k, l]) => `<tr><td>${l}</td>${S.responses.map(r => `<td>${r.metrics ? esc(r.metrics[k]) : '…'}</td>`).join('')}</tr>`).join('')}</tbody></table>` : '(none yet)';
+    const v = CONFIG.vad, n = CONFIG.nod;
+    $('rv-rule').textContent = `Coding rule: speech = RMS above max(noise floor × ${v.thresholdFactor}, ${v.minThreshold}); segments under ${v.minSpeechMs} ms dropped; silent pause ≥ ${v.silentPauseMs} ms; long silence ≥ ${v.longPauseMs} ms; abandoned if no speech or trailing silence ≥ ${v.abandonTrailingMs} ms. Browser recognizers usually drop “um” and “uh”, so code filled pauses from the audio. Agent nod rule: a pause of ${n.pauseMs} ms after at least ${n.minSpeechMs} ms of speech, at most once per ${n.minGapMs} ms.`;
+    $('rv-log').innerHTML = [...S.turns].reverse().map(t => `<div class="log-entry"><span class="tag">${t.speaker}</span><span class="tag">${t.stage}</span>${t.variant ? `<span class="tag">${t.variant}</span>` : ''}<div>${esc(t.text)}</div></div>`).join('') || '(empty)';
+    $('rv-device').textContent = `${Log.device().length} saved session(s)`;
+  },
+  toggleResearcher(force) {
+    const open = force ?? $('researcher-panel').hidden;
+    $('researcher-panel').hidden = !open; document.body.classList.toggle('researcher-open', open);
+    if (open) { $('researcher-toggle').hidden = false; fillVoices(); this.renderResearcher(); }
+  },
+};
+
+/* =====================================================================
+   9. CONTROLLER
+   ===================================================================== */
+const STALE = Symbol('stale');
+window.addEventListener('unhandledrejection', e => { if (e.reason === STALE) e.preventDefault(); });
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let chosenVoice = null;
+function fillVoices() {
+  if (!window.speechSynthesis) { $('rv-voice').innerHTML = '<option>Not available</option>'; return; }
+  const vs = speechSynthesis.getVoices().filter(v => v.lang && v.lang.startsWith('en'));
+  $('rv-voice').innerHTML = '<option value="">Browser default (English)</option>' + vs.map(v => `<option value="${esc(v.name)}" ${chosenVoice && chosenVoice.name === v.name ? 'selected' : ''}>${esc(v.name)} (${v.lang})</option>`).join('');
+}
+if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => { if (!$('researcher-panel').hidden) fillVoices(); };
+
+/* The agent speaks with the same voice and rate in every cell. Captions show the agent's words (never the participant's). */
+function speak(text) {
+  return new Promise(res => {
+    const fallback = () => setTimeout(res, 600 + text.length * 55);
+    if (!window.speechSynthesis) return fallback();
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text); u.lang = 'en-US'; u.rate = 1; u.pitch = 1;
+      const v = chosenVoice || speechSynthesis.getVoices().find(v => v.lang === 'en-US'); if (v) { u.voice = v; S.ttsVoice = v.name; }
+      let done = false; const fin = () => { if (!done) { done = true; clearTimeout(to); res(); } };
+      const to = setTimeout(fin, 1500 + text.length * 90);
+      u.onend = fin; u.onerror = fin; speechSynthesis.speak(u);
+    } catch { fallback(); }
+  });
+}
+
+/* Neutral content reflection. Same rule in every cell. Never evaluative: no praise, no comment on delivery.
+   It restates the participant's stated position and/or the first topic they mentioned. Lexicon is a starting point: tune it after piloting. */
+const Reflect = {
+  topics: [
+    { id: 'flexibility',    re: /flexib|schedul|own pace/,                                   phrase: 'flexibility' },
+    { id: 'responsibility', re: /responsib|adult|independen|own (choice|decision)|autonom/,  phrase: 'personal responsibility' },
+    { id: 'engagement',     re: /engag|motivat|participat|discussion|interact/,              phrase: 'student engagement' },
+    { id: 'performance',    re: /\bgrades?\b|\bexams?\b|\btests?\b|perform|academic|succe/,  phrase: 'academic performance' },
+    { id: 'materials',      re: /record|online|video|slides|lecture notes|textbook/,         phrase: 'access to course materials' },
+    { id: 'financial',      re: /\bjobs?\b|part-time|tuition|afford|\bmoney\b/,              phrase: 'financial pressure' },
+    { id: 'wellbeing',      re: /\bsick|illness|health|mental|stress|anxiety/,               phrase: 'student wellbeing' },
+    { id: 'discipline',     re: /disciplin|habit|routine|structure|commit/,                  phrase: 'discipline' },
+    { id: 'quality',        re: /boring|professor|teacher|instructor|quality/,               phrase: 'the quality of the classes' },
+    { id: 'social',         re: /friends|social|network|community|\bpeers?\b/,               phrase: 'the social side of university' },
+  ],
+  clean: t => (t || '').toLowerCase().replace(/[’]/g, "'"),
+  cap: s => s.charAt(0).toUpperCase() + s.slice(1),
+  stance(t) {
+    const against = /should(n't| not) (be )?(required|mandatory|compulsory|enforced)|should(n't| not) (require|mandate)|\boptional\b|(their|his|her) own (choice|decision)|up to (the )?(student|them)/.test(t);
+    const pro = /should (be )?(required|mandatory|compulsory|enforced)|should (require|mandate)|must (be )?(required|mandatory)|attendance is (important|necessary|essential)/.test(t);
+    return pro && !against ? 'for' : against && !pro ? 'against' : '';   // ambiguous -> no stance reflection
+  },
+  topic(t) {
+    let best = null;
+    for (const tp of this.topics) { const m = tp.re.exec(t); if (m && (!best || m.index < best.index)) best = { ...tp, index: m.index }; }
+    return best;   // earliest-mentioned topic
+  },
+  build(id) {
+    const r = S.responses.find(x => x.id === id), t = this.clean(r && r.asrText);
+    const enough = t.split(/\s+/).filter(Boolean).length >= 6;
+    const stance = enough && id === 'main' ? this.stance(t) : '';
+    const tp = enough ? this.topic(t) : null, ph = tp && tp.phrase;
+    const st = stance === 'for' ? 'should be required' : 'should not be required';
+    let text, kind;
+    if (id === 'main') {
+      const tail = ' I have a couple of follow-up questions.';
+      if (stance && tp)  { kind = 'stance+topic'; text = `Okay. So you think attendance ${st}, and ${ph} was part of your reasoning.${tail}`; }
+      else if (stance)   { kind = 'stance';       text = `Okay. So you think attendance ${st}.${tail}`; }
+      else if (tp)       { kind = 'topic';        text = `Okay. ${this.cap(ph)} was part of what you talked about.${tail}`; }
+      else               { kind = 'generic';      text = `Okay, thank you.${tail}`; }
+    } else if (id === 'follow1') {
+      if (tp) { kind = 'topic'; text = `Okay. So ${ph} is the main reason you gave. Here is the next question.`; }
+      else    { kind = 'generic'; text = 'Okay, thank you. Here is the next question.'; }
+    } else {
+      if (tp) { kind = 'topic'; text = `Okay. ${this.cap(ph)} is part of how you would respond to them.`; }
+      else    { kind = 'generic'; text = 'Okay, thank you.'; }
+    }
+    return { text, kind, stance, topic: tp ? tp.id : '' };
+  },
+};
+
+async function agentSays(text, stage, variant = 'invariant') {
+  const mine = S;
+  UI.setAgent('speaking'); $('caption').textContent = text;
+  Log.turn({ speaker: 'agent', stage, variant, text });
+  await speak(text);
+  if (S !== mine) throw STALE;
+  UI.setAgent('idle');
+  await sleep(350);
+  if (S !== mine) throw STALE;
+}
+async function reflectAndSay(id) {
+  const resp = S.responses.find(x => x.id === id); if (!resp) return;
+  const r = Reflect.build(id);
+  resp.reflect = { kind: r.kind, stance: r.stance, topic: r.topic };
+  Log.event('reflection', { id, ...resp.reflect });
+  await agentSays(r.text, 'ack_' + id, 'reflect:' + r.kind);
+}
+
+/* Listening nods, triggered by pauses in the participant's speech. Same rule in every cell. */
+const Nod = {
+  off: () => {}, timer: null, count: 0, last: 0, voiced: 0, quiet: 0,
+  fire(t) { const el = $('agent-embodiment'); el.classList.remove('nodding'); void el.offsetWidth; el.classList.add('nodding'); this.last = t; this.count++; },
+  start() {
+    this.count = 0; this.voiced = 0; this.quiet = 0; this.last = performance.now();
+    if (S.sim) return;
+    const v = CONFIG.nod, f = CONFIG.vad.frameMs, thr = S.mic.threshold || CONFIG.vad.minThreshold;
+    this.off = Audio.onFrame((r, t) => {
+      if (r >= thr) { this.voiced += f; this.quiet = 0; return; }
+      this.quiet += f;
+      if (this.quiet >= v.pauseMs && this.voiced >= v.minSpeechMs && t - this.last >= v.minGapMs) { this.fire(t); this.voiced = 0; }
+    });
+  },
+  simPoke() {   // typed-speech pilot mode
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => { const t = performance.now(); if (t - this.last >= CONFIG.nod.minGapMs) this.fire(t); }, CONFIG.nod.pauseMs);
+  },
+  stop() { this.off(); this.off = () => {}; clearTimeout(this.timer); return this.count; },
+};
+
+function countdown(seconds, label, onTick) {
+  const mine = S;
+  return new Promise(res => {
+    const end = performance.now() + seconds * 1000;
+    const tick = () => {
+      if (S !== mine) { clearInterval(iv); return; }
+      const left = Math.max(0, (end - performance.now()) / 1000);
+      UI.setStatus(false, label, fmt(Math.ceil(left))); onTick && onTick(left);
+      if (left <= 0) { clearInterval(iv); res(); }
+    };
+    const iv = setInterval(tick, 200); tick();
+  });
+}
+
+/* Microphone check: identical in every cell; never shows recognized text. */
+async function micCheck() {
+  const set = (id, cls) => { $(id).classList.remove('ok', 'bad'); if (cls) $(id).classList.add(cls); };
+  $('mic-start').disabled = true; $('mic-error').textContent = '';
+  if (S.sim) { ['chk-perm', 'chk-quiet', 'chk-voice', 'chk-asr'].forEach(id => set(id, 'ok')); $('mic-error').textContent = 'Pilot mode: simulated speech, microphone skipped.'; $('mic-next').disabled = false; return; }
+  try { await Audio.open(); S.mic.permission = true; set('chk-perm', 'ok'); }
+  catch (e) { set('chk-perm', 'bad'); $('mic-error').textContent = 'The microphone could not be opened. Check that this page is allowed to use it, then try again.'; $('mic-start').disabled = false; Log.event('mic_error', { error: String(e) }); return; }
+  const off = Audio.onFrame(r => { $('mic-level').style.width = Math.min(100, r * 900) + '%'; });
+  const quiet = []; const offQ = Audio.onFrame(r => quiet.push(r)); await sleep(3000); offQ();
+  quiet.sort((a, b) => a - b); const floor = quiet[Math.floor(quiet.length / 2)] || 0.002;
+  S.mic.noiseFloor = floor; S.mic.threshold = Math.max(floor * CONFIG.vad.thresholdFactor, CONFIG.vad.minThreshold); set('chk-quiet', 'ok');
+  Log.event('calibrated', { noiseFloor: floor, threshold: S.mic.threshold });
+  $('mic-error').textContent = 'Now say: “Testing, one, two, three. The weather is nice today.”';
+  let voiced = 0; const offV = Audio.onFrame(r => { if (r >= S.mic.threshold) voiced += CONFIG.vad.frameMs; if (voiced > 600) set('chk-voice', 'ok'); });
+  let heard = false;
+  if (SR) {
+    ASR.start(performance.now(), () => { if (ASR.finals.length || ASR.interim.length > 4) { heard = true; set('chk-asr', 'ok'); } });
+    const t0 = performance.now(); while (!heard && performance.now() - t0 < 10000) await sleep(200);
+    await ASR.stop();
+  }
+  offV(); off(); S.mic.asrOk = heard;
+  if (!heard) { set('chk-asr', 'bad'); }
+  if (voiced > 600 && heard) { $('mic-error').textContent = ''; $('mic-next').disabled = false; }
+  else { $('mic-error').textContent = voiced > 600 ? 'Your voice was detected but not recognized. Check your internet connection and try again.' : 'We could not hear you. Move closer to the microphone and try again.'; $('mic-start').disabled = false; }
+  Log.event('mic_check', { voicedMs: voiced, asrOk: heard });
+}
+
+async function startChat() {
+  S.locked = true; S.times.chatStart = new Date().toISOString(); Log.event('chat_start', { role: S.role, transcript: S.transcript });
+  UI.applyAgent(); UI.initSpeechPanel(); UI.setPrompt(''); $('caption').textContent = '';
+  $('start-btn').hidden = true; $('done-btn').hidden = false; $('done-btn').disabled = true; $('foot-hint').textContent = '';
+  UI.show('chat'); S.phase = 'intro'; UI.setPhase('Introduction'); UI.setStatus(false, 'Not recording', '');
+  await sleep(600);
+  await agentSays(SCRIPT.intro[S.role](), 'intro', S.role);
+  await agentSays(SCRIPT.plan(), 'plan');
+  const T = CONFIG.timing[S.timingKey];
+  S.phase = 'topic'; UI.setPhase('Topic'); UI.setPrompt(CONFIG.prompt);
+  await agentSays(SCRIPT.topic(), 'topic');
+  await agentSays(SCRIPT.prep(), 'prep');
+  S.phase = 'prep'; UI.setPhase('Think about your answer'); UI.setAgent('listening');
+  await countdown(T.prepS, 'Time to think');
+  await agentSays(SCRIPT.begin(), 'begin');
+  await respond('main', 'Your answer', T.mainS);
+  await reflectAndSay('main');
+  for (let i = 0; i < CONFIG.followUps.length; i++) {
+    const q = CONFIG.followUps[i];
+    UI.setPhase(`Follow-up question ${i + 1} of ${CONFIG.followUps.length}`); UI.setPrompt(q);
+    await agentSays(q, 'follow' + (i + 1));
+    await respond('follow' + (i + 1), `Follow-up ${i + 1}`, T.followS);
+    await reflectAndSay('follow' + (i + 1));
+  }
+  await agentSays(SCRIPT.closing(), 'closing');
+  S.phase = 'closed'; S.times.chatEnd = new Date().toISOString(); Log.event('chat_end'); Log.saveToDevice();
+  UI.setPhase('Conversation complete'); UI.setStatus(false, 'Not recording', '');
+  $('done-btn').hidden = true; const b = $('start-btn'); b.hidden = false; b.textContent = S.skipSurveys ? 'Finish' : 'Continue to questions'; b.focus();
+  b.onclick = () => { if (S.skipSurveys) finish(); else { S.postPage = 0; UI.renderPost(); UI.show('post'); } };
+}
+
+/* One response window: starts when the agent finishes speaking, ends on "I'm finished" or at the time limit. */
+function respond(id, label, maxS) {
+  const mine = S;
+  return new Promise(async resolve => {
+    S.phase = id; UI.setAgent('listening');
+    const startT = performance.now();
+    const resp = { id, label, question: id === 'main' ? CONFIG.prompt : CONFIG.followUps[+id.slice(-1) - 1], startedAt: new Date().toISOString(), startT, frames: [], sim: S.sim, simSegs: [], asrText: '', endedBy: '' };
+    const done = S.responses.slice();
+    // Voice activity frames (relative ms), recording and ASR run identically in every cell.
+    let offFrame = () => {};
+    if (!S.sim && Audio.stream) offFrame = Audio.onFrame((r, t) => resp.frames.push([Math.round(t - startT), +r.toFixed(5)]));
+    const recording = !S.sim && Audio.startRecording();
+    const render = () => UI.renderTranscript(done, { label, text: S.sim ? $('sim-input').value : ASR.text(), interim: S.sim ? '' : ASR.interim });
+    if (!S.sim) ASR.start(startT, render);
+    Nod.start();
+    // Simulated speech: each keystroke burst becomes a speech segment.
+    const simIn = $('sim-input'); simIn.value = ''; let lastKey = -1e9;
+    const onKey = () => { Nod.simPoke(); const t = performance.now() - startT; const last = resp.simSegs[resp.simSegs.length - 1];
+      if (last && t - last.e < CONFIG.vad.silentPauseMs + 600) last.e = t + 200; else resp.simSegs.push({ s: t, e: t + 200 }); lastKey = t; render(); };
+    if (S.sim) { simIn.addEventListener('input', onKey); simIn.focus(); }
+    render();
+    const btn = $('done-btn'); btn.disabled = true; $('foot-hint').textContent = 'Speak your answer. Select “I’m finished” when you are done.';
+    const minT = setTimeout(() => { if (S === mine) btn.disabled = false; }, CONFIG.timing[S.timingKey].minS * 1000);
+    let ended = false;
+    const end = async how => {
+      if (ended) return; ended = true; clearInterval(iv); clearTimeout(minT); btn.onclick = null; btn.disabled = true;
+      resp.endedBy = how; resp.endT = performance.now();
+      offFrame(); if (S.sim) simIn.removeEventListener('input', onKey);
+      resp.nods = Nod.stop();
+      const blob = recording ? await Audio.stopRecording() : null;
+      if (!S.sim) await ASR.stop();
+      if (S !== mine) return;
+      resp.asrText = S.sim ? simIn.value.trim() : ASR.text();
+      resp.asrFinals = S.sim ? [] : ASR.finals.slice(); resp.asrRestarts = S.sim ? 0 : ASR.restarts; resp.asrErrors = S.sim ? [] : ASR.errors.slice();
+      resp.metrics = computeMetrics(resp);
+      resp.segments = S.sim ? resp.simSegs.map(s => [Math.round(s.s), Math.round(s.e)]) : speechSegments(resp.frames, S.mic.threshold || CONFIG.vad.minThreshold).map(s => [s.s, s.e]);
+      if (blob) { resp.audio = blob; resp.audioName = `speaking_${S.pid || 'nopid'}_${S.sessionId}_${id}.${(blob.type.split('/')[1] || 'webm').split(';')[0]}`; }
+      delete resp.frames;  // raw frames are summarized into segments; keep the export small
+      Log.turn({ speaker: 'participant', stage: id, text: resp.asrText || '(no speech recognized)' });
+      Log.event('response_end', { id, endedBy: how, ...resp.metrics });
+      UI.renderTranscript(S.responses, null);
+      UI.setStatus(false, 'Not recording', ''); UI.setAgent('idle'); $('foot-hint').textContent = '';
+      UI.renderResearcher();
+      resolve();
+    };
+    S.responses.push(resp);
+    btn.onclick = () => end('button');
+    const iv = setInterval(() => {
+      if (S !== mine) { clearInterval(iv); return; }
+      const el = (performance.now() - startT) / 1000;
+      UI.setStatus(true, 'Recording', fmt(Math.ceil(maxS - el)));
+      if (el >= maxS) end('timeout');
+    }, 200);
+    Log.event('response_start', { id });
+  });
+}
+
+function finish() {
+  S.times.finished = new Date().toISOString();
+  if (CONFIG.attentionCheck && !S.skipSurveys) S.attentionPassed = S.responsesQ.attn === ATTENTION[2];
+  Log.event('finished'); Log.saveToDevice();
+  $('done-code').textContent = `Completion code: ${S.sessionId}`;
+  const acts = $('done-actions'); acts.innerHTML = '';
+  if (CONFIG.completionUrl) { const a = document.createElement('a'); a.className = 'btn'; a.style.textDecoration = 'none'; a.textContent = 'Return to the study site'; a.href = CONFIG.completionUrl.replace('{pid}', encodeURIComponent(S.pid)); acts.appendChild(a); }
+  UI.show('done');
+}
+
+function newSession() {
+  try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch {}
+  ASR.active = false; try { ASR.rec && ASR.rec.abort(); } catch {}
+  try { Nod.stop(); } catch {}
+  S = freshState();
+  const [cell, by] = assign(); [S.role, S.transcript] = cell.split(','); S.assignedBy = by;
+  $('pid').value = S.pid; $('consent').checked = false; $('intro-error').textContent = '';
+  $('browser-warning').hidden = !!SR || S.sim;
+  ['chk-perm', 'chk-quiet', 'chk-voice', 'chk-asr'].forEach(id => $(id).classList.remove('ok', 'bad'));
+  $('mic-start').disabled = false; $('mic-next').disabled = true; $('mic-error').textContent = '';
+  $('caption').textContent = ''; UI.setAgent('idle'); UI.applyAgent();
+  Log.event('session_created', { cell, assignedBy: by });
+  UI.show('intro');
+}
+function restartAs(cell) {
+  const pid = S.pid, skip = S.skipSurveys, sim = S.sim, timing = S.timingKey, mic = S.mic;
+  Log.event('restarted_by_researcher', { to: cell }); S.interrupted = true; Log.saveToDevice();
+  newSession(); S.pid = pid || 'test'; S.skipSurveys = skip; S.sim = sim; S.timingKey = timing; S.mic = mic;
+  [S.role, S.transcript] = cell.split(','); S.assignedBy = 'researcher';
+  startChat();
+}
+
+/* Wiring */
+$('intro-start').addEventListener('click', () => {
+  const pid = $('pid').value.trim();
+  if (!pid) { $('intro-error').textContent = 'Please enter your participant ID.'; $('pid').focus(); return; }
+  if (!$('consent').checked) { $('intro-error').textContent = 'Please confirm that you agree to take part.'; $('consent').focus(); return; }
+  S.pid = pid; Log.event('consented');
+  if (S.skipSurveys) { UI.show('mic'); return; }
+  UI.renderPre(); UI.show('pre');
+});
+$('pre-next').addEventListener('click', () => {
+  const miss = UI.collect($('pre-form'));
+  $('pre-error').textContent = miss ? `Please answer the ${miss} highlighted question${miss > 1 ? 's' : ''}.` : '';
+  if (miss) return; Log.event('pre_complete'); UI.show('mic');
+});
+$('pre-form').addEventListener('change', e => { const f = e.target.closest('[data-item]'); if (f) f.classList.remove('missing'); });
+$('mic-start').addEventListener('click', micCheck);
+$('mic-next').addEventListener('click', () => { speak(' '); startChat(); });   // the click also unlocks speech output
+$('post-next').addEventListener('click', () => {
+  const miss = UI.collect($('post-form'));
+  $('post-error').textContent = miss ? `Please answer the ${miss} highlighted question${miss > 1 ? 's' : ''}.` : '';
+  if (miss) return; Log.event('post_page_complete', { page: POST_PAGES[S.postPage].id });
+  if (S.postPage < POST_PAGES.length - 1) { S.postPage++; UI.renderPost(); UI.show('post'); } else finish();
+});
+$('post-form').addEventListener('change', e => { const f = e.target.closest('[data-item]'); if (f) f.classList.remove('missing'); });
+
+$('researcher-toggle').addEventListener('click', () => UI.toggleResearcher());
+$('rv-close').addEventListener('click', () => UI.toggleResearcher(false));
+document.addEventListener('keydown', e => { if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) { e.preventDefault(); UI.toggleResearcher(); } });
+const onCellChange = () => {
+  const cell = `${$('rv-role').value},${$('rv-tx').value}`;
+  if (!S.locked) { [S.role, S.transcript] = cell.split(','); S.assignedBy = 'researcher'; UI.applyAgent(); Log.event('condition_override', { cell }); }
+  else restartAs(cell);
+};
+$('rv-role').addEventListener('change', onCellChange); $('rv-tx').addEventListener('change', onCellChange);
+document.querySelectorAll('[data-restart]').forEach(b => b.addEventListener('click', () => restartAs(b.dataset.restart)));
+$('rv-skip').addEventListener('change', e => { S.skipSurveys = e.target.value === 'yes'; UI.renderResearcher(); });
+$('rv-input').addEventListener('change', e => { if (!S.locked) { S.sim = e.target.value === 'sim' || !SR; $('browser-warning').hidden = !!SR || S.sim; } UI.renderResearcher(); });
+$('rv-timing').addEventListener('change', e => { S.timingKey = e.target.value; });
+$('rv-voice').addEventListener('change', e => { chosenVoice = speechSynthesis.getVoices().find(v => v.name === e.target.value) || null; });
+$('rv-name').addEventListener('change', e => { const v = e.target.value.trim(); if (v && !S.locked) { CONFIG.agent.name = v; UI.applyAgent(); } });
+$('rv-avatar').addEventListener('change', e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => { CONFIG.agent.avatar = r.result; UI.applyAgent(); }; r.readAsDataURL(f); });
+$('rv-reset').addEventListener('click', () => { newSession(); UI.renderResearcher(); });
+
+function download(name, data, type) {
+  try { const url = URL.createObjectURL(data instanceof Blob ? data : new Blob([data], { type })); const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 4000);
+    $('rv-data-note').textContent = `Download started: ${name}. If nothing downloads (embedded viewers block downloads), use Copy.`; }
+  catch { $('rv-data-note').textContent = 'Download is blocked here. Use Copy instead.'; }
+}
+async function copy(text, label) {
+  const area = $('rv-copy-area'); area.hidden = false; area.value = text;
+  try { await navigator.clipboard.writeText(text); $('rv-data-note').textContent = `${label} copied to the clipboard.`; }
+  catch { area.select(); $('rv-data-note').textContent = `Copy was blocked. ${label} is selected in the box below: press Ctrl+C or Cmd+C.`; }
+}
+const stamp = () => `${S.pid || 'nopid'}_${S.sessionId}`;
+$('rv-dl-json').addEventListener('click', () => download(`speaking_${stamp()}.json`, JSON.stringify(Log.full(), null, 2), 'application/json'));
+$('rv-dl-csv').addEventListener('click', () => download(`speaking_${stamp()}.csv`, Log.csv([Log.record()]), 'text/csv'));
+$('rv-dl-audio').addEventListener('click', async () => {
+  const withAudio = S.responses.filter(r => r.audio);
+  if (!withAudio.length) { $('rv-data-note').textContent = 'No audio recorded in this session (simulated input, or recording unavailable).'; return; }
+  for (const r of withAudio) { download(r.audioName, r.audio); await sleep(400); }
+});
+$('rv-copy-json').addEventListener('click', () => copy(JSON.stringify(Log.full(), null, 2), 'Session JSON'));
+$('rv-copy-csv').addEventListener('click', () => copy(Log.csv([Log.record()]), 'Session CSV'));
+$('rv-dl-all').addEventListener('click', () => download('speaking_all_sessions.csv', Log.csv(Log.device()), 'text/csv'));
+$('rv-copy-all').addEventListener('click', () => copy(Log.csv(Log.device()), 'All sessions CSV'));
+$('rv-clear-all').addEventListener('click', () => {
+  const b = $('rv-clear-all');
+  if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Click again to delete all device data'; setTimeout(() => { b.dataset.armed = ''; b.textContent = 'Clear device data'; }, 4000); return; }
+  try { localStorage.removeItem(CONFIG.storageKey); } catch {}
+  b.dataset.armed = ''; b.textContent = 'Clear device data'; $('rv-data-note').textContent = 'Device data cleared.'; UI.renderResearcher();
+});
+
+newSession();
+if (CONFIG.showResearcherButton || params.get('researcher') === '1' || hashFlags.has('researcher')) $('researcher-toggle').hidden = false;
+if (params.get('researcher') === '1' || hashFlags.has('researcher')) UI.toggleResearcher(true);
+</script>
+</body>
+</html>
